@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Offline PDF Signer (Resizable Corners + Navigation + Zoom)</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background:#f6f7f9; }
+    header { padding: 10px 12px; background:#111827; color:#fff; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    header .group { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    label { font-size: 13px; opacity: .95; }
+    input[type="file"] { color:#fff; }
+    button {
+      background:#22c55e; border:none; color:#0b1220; font-weight:800;
+      padding:8px 10px; border-radius:10px; cursor:pointer;
+    }
+    button.secondary { background:#e5e7eb; color:#111827; font-weight:700; }
+    button.warn { background:#fbbf24; color:#111827; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    select, input[type="number"] {
+      padding:7px 10px; border-radius:10px; border:1px solid #d1d5db;
+      background:#fff;
+    }
+    main { padding: 12px; display:flex; gap:12px; flex-wrap:wrap; }
+    .panel {
+      background:#fff; border:1px solid #e5e7eb; border-radius:14px;
+      padding:12px; box-shadow: 0 1px 2px rgba(0,0,0,.05);
+      flex: 1 1 290px; min-width: 270px;
+    }
+    .panel h3 { margin:0 0 10px; font-size: 14px; color:#111827; }
+    .hint { font-size: 12px; color:#4b5563; line-height: 1.35; }
+    .canvasWrap {
+      position: relative;
+      background:#fff; border:1px solid #e5e7eb; border-radius:14px;
+      padding:10px;
+      box-shadow: 0 1px 2px rgba(0,0,0,.05);
+      overflow:auto;
+      max-width: 100%;
+      flex: 3 1 700px; min-width: 320px;
+      height: calc(100vh - 96px); /* make room for header */
+    }
+    #stage { position: relative; display: inline-block; user-select: none; }
+    #pdfCanvas { display:block; }
+    /* Signature overlay container */
+    #sigBox {
+      position:absolute;
+      left:0; top:0;
+      transform-origin: top left;
+      cursor: move;
+      touch-action: none;
+      border: 1px dashed rgba(16,185,129,.9);
+      box-shadow: 0 2px 10px rgba(0,0,0,.15);
+      background: rgba(255,255,255,.10);
+      display:none;
+    }
+    #sigImg { display:block; width:100%; height:100%; pointer-events:none; user-select:none; }
+    .handle {
+      position:absolute;
+      width:12px; height:12px;
+      border-radius:999px;
+      background:#22c55e;
+      border:2px solid #ffffff;
+      box-shadow: 0 1px 4px rgba(0,0,0,.25);
+      touch-action:none;
+    }
+    .handle.tl { left:-7px; top:-7px; cursor:nwse-resize; }
+    .handle.tr { right:-7px; top:-7px; cursor:nesw-resize; }
+    .handle.bl { left:-7px; bottom:-7px; cursor:nesw-resize; }
+    .handle.br { right:-7px; bottom:-7px; cursor:nwse-resize; }
+
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .kpi { font-size: 12px; color:#111827; background:#f3f4f6; padding:6px 10px; border-radius:999px; }
+    code { background:#f3f4f6; padding:2px 6px; border-radius:8px; }
+    .status { font-size:12px; color:#6b7280; margin-top:8px; }
+    .tiny { font-size:12px; color:#9ca3af; }
+    .sep { width:1px; height:26px; background:rgba(255,255,255,.18); margin:0 4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="group">
+      <label>PDF:
+        <input id="pdfInput" type="file" accept="application/pdf" />
+      </label>
+      <label>Signature PNG:
+        <input id="sigInput" type="file" accept="image/png" />
+      </label>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="group">
+      <button id="firstBtn" class="secondary" disabled>|&lt;</button>
+      <button id="prevBtn" class="secondary" disabled>&lt;</button>
+      <label>Page:
+        <select id="pageSelect" disabled></select>
+      </label>
+      <button id="nextBtn" class="secondary" disabled>&gt;</button>
+      <button id="lastBtn" class="secondary" disabled>&gt;|</button>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="group">
+      <button id="zoomOutBtn" class="secondary" disabled>-</button>
+      <select id="zoomMode" disabled>
+        <option value="fitPage">Fit Page</option>
+        <option value="fitWidth">Fit Width</option>
+        <option value="custom">Custom</option>
+      </select>
+      <input id="zoomPct" type="number" min="25" max="400" step="5" value="100" disabled style="width:84px" />
+      <span class="tiny">%</span>
+      <button id="zoomInBtn" class="secondary" disabled>+</button>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="group">
+      <button id="saveBtn" disabled>Save signed PDF</button>
+      <button id="resetBtn" class="warn" disabled>Reset signature</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="panel">
+      <h3>What changed (per your request)</h3>
+      <div class="hint">
+        <ol style="margin-top:0">
+          <li><b>Resize via 4 corner handles</b> (no mouse wheel scaling).</li>
+          <li><b>Page navigation buttons</b>: first / prev / next / last.</li>
+          <li><b>Zoom controls</b> (Fit Page / Fit Width / Custom %) so you can see the whole page without scrolling.</li>
+        </ol>
+        <p class="hint">Tip: For “no scrolling”, use <b>Fit Page</b>. If your window is short, zoom out a bit more with Custom %.</p>
+      </div>
+
+      <hr style="border:none; border-top:1px solid #e5e7eb; margin:12px 0;" />
+
+      <h3>Signature position & size</h3>
+      <div class="row"><span class="kpi" id="posKpi">x: -, y: -, w: -, h: -</span></div>
+      <div class="status" id="status">Ready. Load a PDF and a PNG signature.</div>
+    </div>
+
+    <div class="canvasWrap" id="canvasWrap">
+      <div id="stage">
+        <canvas id="pdfCanvas"></canvas>
+
+        <!-- signature box -->
+        <div id="sigBox" aria-label="signature">
+          <img id="sigImg" alt="signature" />
+          <div class="handle tl" data-handle="tl"></div>
+          <div class="handle tr" data-handle="tr"></div>
+          <div class="handle bl" data-handle="bl"></div>
+          <div class="handle br" data-handle="br"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Local libs (must be placed in ./libs/) -->
+  <script src="libs/pdf.min.js"></script>
+  <script src="libs/pdf-lib.min.js"></script>
+  <script>
+    // Set worker path BEFORE using pdfjsLib.getDocument
+    if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = "libs/pdf.worker.min.js";
+  </script>
+
+  <script>
+    // -------------------- State --------------------
+    let pdfjsDoc = null;
+    let pdfArrayBuffer = null;
+    let originalPdfName = null;
+
+    let sigPngBytes = null;
+    let sigNaturalW = 0, sigNaturalH = 0;
+
+    let currentPage = 1;
+    let pageViewport = null;
+    let viewportScale = 1.0;
+
+    // signature box in screen px relative to stage
+    let sigX = 60, sigY = 80;
+    let sigW = 200, sigH = 80;
+
+    // dragging / resizing
+    let dragging = false;
+    let resizing = false;
+    let activeHandle = null;
+    let startX = 0, startY = 0;
+    let startSig = null;
+    const MIN_SIG_W = 24;
+    const keepAspect = true;
+
+    // -------------------- Elements --------------------
+    const pdfInput = document.getElementById("pdfInput");
+    const sigInput = document.getElementById("sigInput");
+    const pageSelect = document.getElementById("pageSelect");
+
+    const firstBtn = document.getElementById("firstBtn");
+    const prevBtn  = document.getElementById("prevBtn");
+    const nextBtn  = document.getElementById("nextBtn");
+    const lastBtn  = document.getElementById("lastBtn");
+
+    const zoomMode = document.getElementById("zoomMode");
+    const zoomPct  = document.getElementById("zoomPct");
+    const zoomOutBtn = document.getElementById("zoomOutBtn");
+    const zoomInBtn  = document.getElementById("zoomInBtn");
+
+    const saveBtn  = document.getElementById("saveBtn");
+    const resetBtn = document.getElementById("resetBtn");
+
+    const pdfCanvas = document.getElementById("pdfCanvas");
+    const ctx = pdfCanvas.getContext("2d", { alpha: false });
+    const canvasWrap = document.getElementById("canvasWrap");
+    const stage = document.getElementById("stage");
+
+    const sigBox = document.getElementById("sigBox");
+    const sigImg = document.getElementById("sigImg");
+
+    const posKpi = document.getElementById("posKpi");
+    const statusEl = document.getElementById("status");
+
+    // -------------------- Helpers --------------------
+    function setStatus(msg) { statusEl.textContent = msg; }
+    function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+    function updateKpi() {
+      posKpi.textContent = `x: ${sigX.toFixed(1)}, y: ${sigY.toFixed(1)}, w: ${sigW.toFixed(1)}, h: ${sigH.toFixed(1)}`;
+    }
+
+    function positionSigBox() {
+      sigBox.style.left = sigX + "px";
+      sigBox.style.top  = sigY + "px";
+      sigBox.style.width  = sigW + "px";
+      sigBox.style.height = sigH + "px";
+      updateKpi();
+    }
+
+    function resetSignaturePlacement() {
+      sigX = 60; sigY = 80;
+      // reasonable initial size based on image
+      const baseW = Math.min(260, Math.max(120, sigNaturalW || 200));
+      const aspect = (sigNaturalW && sigNaturalH) ? (sigNaturalH / sigNaturalW) : 0.35;
+      sigW = baseW;
+      sigH = baseW * aspect;
+      positionSigBox();
+    }
+
+    function enableControls() {
+      const hasPdf = !!pdfjsDoc;
+      const hasSig = !!sigPngBytes;
+
+      pageSelect.disabled = !hasPdf;
+      firstBtn.disabled = !hasPdf;
+      prevBtn.disabled = !hasPdf;
+      nextBtn.disabled = !hasPdf;
+      lastBtn.disabled = !hasPdf;
+
+      zoomMode.disabled = !hasPdf;
+      zoomPct.disabled = !(hasPdf && zoomMode.value === "custom");
+      zoomOutBtn.disabled = !hasPdf;
+      zoomInBtn.disabled = !hasPdf;
+
+      saveBtn.disabled = !(hasPdf && hasSig);
+      resetBtn.disabled = !hasSig;
+    }
+
+    function populatePageSelect(numPages) {
+      pageSelect.innerHTML = "";
+      for (let i = 1; i <= numPages; i++) {
+        const opt = document.createElement("option");
+        opt.value = String(i);
+        opt.textContent = String(i);
+        pageSelect.appendChild(opt);
+      }
+      pageSelect.value = String(currentPage);
+    }
+
+    async function computeScaleForMode(page) {
+      // Get unscaled viewport to compute fit sizes
+      const v1 = page.getViewport({ scale: 1.0 });
+      const wrapW = canvasWrap.clientWidth - 20;  // padding-ish
+      const wrapH = canvasWrap.clientHeight - 20;
+
+      const mode = zoomMode.value;
+      if (mode === "fitWidth") {
+        return wrapW / v1.width;
+      }
+      if (mode === "fitPage") {
+        return Math.min(wrapW / v1.width, wrapH / v1.height);
+      }
+      // custom
+      const pct = clamp(Number(zoomPct.value || 100), 25, 400);
+      return pct / 100;
+    }
+
+    async function renderPage(pageNum) {
+      currentPage = pageNum;
+      const page = await pdfjsDoc.getPage(pageNum);
+
+      viewportScale = await computeScaleForMode(page);
+      pageViewport = page.getViewport({ scale: viewportScale });
+
+      pdfCanvas.width = Math.floor(pageViewport.width);
+      pdfCanvas.height = Math.floor(pageViewport.height);
+
+      stage.style.width = pdfCanvas.width + "px";
+      stage.style.height = pdfCanvas.height + "px";
+
+      ctx.save();
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, pdfCanvas.width, pdfCanvas.height);
+      ctx.restore();
+
+      await page.render({ canvasContext: ctx, viewport: pageViewport }).promise;
+
+      // keep signature visible-ish
+      if (sigPngBytes) {
+        sigX = clamp(sigX, -pdfCanvas.width * 0.25, pdfCanvas.width * 0.95);
+        sigY = clamp(sigY, -pdfCanvas.height * 0.25, pdfCanvas.height * 0.95);
+        positionSigBox();
+      }
+
+      pageSelect.value = String(currentPage);
+      setStatus(`Viewing page ${currentPage} / ${pdfjsDoc.numPages} (zoom ${(viewportScale*100).toFixed(0)}%).`);
+      enableControls();
+    }
+
+    async function goToPage(n) {
+      if (!pdfjsDoc) return;
+      const nn = clamp(n, 1, pdfjsDoc.numPages);
+      await renderPage(nn);
+    }
+
+    // -------------------- Load PDF --------------------
+    pdfInput.addEventListener("change", async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      try {
+        setStatus("Loading PDF...");
+        originalPdfName = file.name;
+        pdfArrayBuffer = await file.arrayBuffer();
+
+        if (!window.pdfjsLib) throw new Error("pdf.js not loaded (libs/pdf.min.js missing?)");
+
+        pdfjsDoc = await pdfjsLib.getDocument({ data: pdfArrayBuffer }).promise;
+        currentPage = 1;
+        populatePageSelect(pdfjsDoc.numPages);
+
+        // default to Fit Page so you don't have to scroll
+        zoomMode.value = "fitPage";
+        zoomPct.value = 100;
+
+        await renderPage(currentPage);
+      } catch (err) {
+        console.error(err);
+        setStatus("Error loading PDF. Check libs are correct. If worker is blocked, use a local server.");
+        alert("PDF load error: " + (err?.message || err));
+      }
+    });
+
+    pageSelect.addEventListener("change", async () => {
+      await goToPage(parseInt(pageSelect.value, 10));
+    });
+
+    firstBtn.addEventListener("click", () => goToPage(1));
+    lastBtn.addEventListener("click", () => goToPage(pdfjsDoc?.numPages || 1));
+    prevBtn.addEventListener("click", () => goToPage(currentPage - 1));
+    nextBtn.addEventListener("click", () => goToPage(currentPage + 1));
+
+    // -------------------- Zoom controls --------------------
+    zoomMode.addEventListener("change", async () => {
+      zoomPct.disabled = !(zoomMode.value === "custom");
+      if (pdfjsDoc) await renderPage(currentPage);
+    });
+
+    zoomPct.addEventListener("change", async () => {
+      zoomMode.value = "custom";
+      zoomPct.disabled = false;
+      if (pdfjsDoc) await renderPage(currentPage);
+    });
+
+    function bumpZoom(deltaPct) {
+      zoomMode.value = "custom";
+      zoomPct.disabled = false;
+      const v = clamp(Number(zoomPct.value || 100) + deltaPct, 25, 400);
+      zoomPct.value = v;
+      if (pdfjsDoc) renderPage(currentPage);
+    }
+    zoomOutBtn.addEventListener("click", () => bumpZoom(-10));
+    zoomInBtn.addEventListener("click", () => bumpZoom(+10));
+
+    // Re-fit on window resize (when fit modes)
+    window.addEventListener("resize", () => {
+      if (!pdfjsDoc) return;
+      if (zoomMode.value !== "custom") renderPage(currentPage);
+    });
+
+    // -------------------- Load signature PNG --------------------
+    sigInput.addEventListener("change", async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      sigPngBytes = new Uint8Array(await file.arrayBuffer());
+
+      const url = URL.createObjectURL(file);
+      sigImg.onload = () => {
+        sigNaturalW = sigImg.naturalWidth;
+        sigNaturalH = sigImg.naturalHeight;
+        sigBox.style.display = "block";
+        resetSignaturePlacement();
+        enableControls();
+        URL.revokeObjectURL(url);
+      };
+      sigImg.src = url;
+    });
+
+    // -------------------- Drag signature box --------------------
+    sigBox.addEventListener("pointerdown", (ev) => {
+      // If user clicked a handle, don't start drag here
+      if (ev.target?.classList?.contains("handle")) return;
+
+      if (!sigPngBytes) return;
+      ev.preventDefault();
+      dragging = true;
+      sigBox.setPointerCapture(ev.pointerId);
+
+      const rect = stage.getBoundingClientRect();
+      startX = ev.clientX - rect.left;
+      startY = ev.clientY - rect.top;
+      startSig = { x: sigX, y: sigY, w: sigW, h: sigH };
+    });
+
+    sigBox.addEventListener("pointermove", (ev) => {
+      if (!dragging) return;
+      ev.preventDefault();
+
+      const rect = stage.getBoundingClientRect();
+      const px = ev.clientX - rect.left;
+      const py = ev.clientY - rect.top;
+
+      const dx = px - startX;
+      const dy = py - startY;
+
+      sigX = startSig.x + dx;
+      sigY = startSig.y + dy;
+      positionSigBox();
+    });
+
+    sigBox.addEventListener("pointerup", (ev) => {
+      dragging = false;
+      try { sigBox.releasePointerCapture(ev.pointerId); } catch {}
+    });
+    sigBox.addEventListener("pointercancel", (ev) => {
+      dragging = false;
+      try { sigBox.releasePointerCapture(ev.pointerId); } catch {}
+    });
+
+    // -------------------- Resize using 4 corner handles --------------------
+    function handlePointerDown(ev) {
+      if (!sigPngBytes) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+
+      resizing = true;
+      activeHandle = ev.target.getAttribute("data-handle");
+      sigBox.setPointerCapture(ev.pointerId);
+
+      const rect = stage.getBoundingClientRect();
+      startX = ev.clientX - rect.left;
+      startY = ev.clientY - rect.top;
+      startSig = { x: sigX, y: sigY, w: sigW, h: sigH };
+    }
+
+    function handlePointerMove(ev) {
+      if (!resizing) return;
+      ev.preventDefault();
+
+      const rect = stage.getBoundingClientRect();
+      const px = ev.clientX - rect.left;
+      const py = ev.clientY - rect.top;
+      const dx = px - startX;
+      const dy = py - startY;
+
+      const aspect = (startSig.w > 0) ? (startSig.h / startSig.w) : 0.35;
+
+      let nx = startSig.x, ny = startSig.y, nw = startSig.w, nh = startSig.h;
+
+      // Compute new box based on handle
+      if (activeHandle === "br") {
+        nw = startSig.w + dx;
+        nh = keepAspect ? nw * aspect : startSig.h + dy;
+      } else if (activeHandle === "tr") {
+        nw = startSig.w + dx;
+        nh = keepAspect ? nw * aspect : startSig.h - dy;
+        ny = keepAspect ? (startSig.y + (startSig.h - nh)) : (startSig.y + dy);
+      } else if (activeHandle === "bl") {
+        nw = startSig.w - dx;
+        nh = keepAspect ? nw * aspect : startSig.h + dy;
+        nx = startSig.x + dx;
+      } else if (activeHandle === "tl") {
+        nw = startSig.w - dx;
+        nh = keepAspect ? nw * aspect : startSig.h - dy;
+        nx = startSig.x + dx;
+        ny = keepAspect ? (startSig.y + (startSig.h - nh)) : (startSig.y + dy);
+      }
+
+      // Clamp min size
+      nw = Math.max(MIN_SIG_W, nw);
+      nh = Math.max(MIN_SIG_W * aspect, nh);
+
+      // If clamped and keepAspect, re-adjust origin for left/top handles
+      if (keepAspect) {
+        if (activeHandle === "tl") {
+          nx = startSig.x + (startSig.w - nw);
+          ny = startSig.y + (startSig.h - nh);
+        } else if (activeHandle === "tr") {
+          ny = startSig.y + (startSig.h - nh);
+        } else if (activeHandle === "bl") {
+          nx = startSig.x + (startSig.w - nw);
+        }
+      }
+
+      sigX = nx; sigY = ny; sigW = nw; sigH = nh;
+      positionSigBox();
+    }
+
+    function handlePointerUp(ev) {
+      resizing = false;
+      activeHandle = null;
+      try { sigBox.releasePointerCapture(ev.pointerId); } catch {}
+    }
+
+    for (const h of sigBox.querySelectorAll(".handle")) {
+      h.addEventListener("pointerdown", handlePointerDown);
+    }
+    sigBox.addEventListener("pointermove", handlePointerMove);
+    sigBox.addEventListener("pointerup", handlePointerUp);
+    sigBox.addEventListener("pointercancel", handlePointerUp);
+
+    resetBtn.addEventListener("click", () => {
+      if (!sigPngBytes) return;
+      resetSignaturePlacement();
+    });
+
+    // -------------------- Save signed PDF (pdf-lib) --------------------
+    saveBtn.addEventListener("click", async () => {
+      try {
+        if (!pdfArrayBuffer || !sigPngBytes || !pdfjsDoc || !pageViewport) return;
+        if (!window.PDFLib) throw new Error("pdf-lib not loaded (libs/pdf-lib.min.js missing?)");
+
+        const { PDFDocument } = PDFLib;
+        const outDoc = await PDFDocument.load(pdfArrayBuffer);
+        const pngImage = await outDoc.embedPng(sigPngBytes);
+
+        const pageIndex = currentPage - 1;
+        const page = outDoc.getPages()[pageIndex];
+
+        // PDF size in points
+        const pageWidth = page.getWidth();
+        const pageHeight = page.getHeight();
+
+        // Screen size
+        const screenPageW = pageViewport.width;
+        const screenPageH = pageViewport.height;
+
+        // Convert signature box from screen to PDF coords
+        const xPdf = (sigX / screenPageW) * pageWidth;
+
+        // screen origin: top-left; pdf origin: bottom-left
+        const yBottomScreen = sigY + sigH;
+        const yPdf = pageHeight - (yBottomScreen / screenPageH) * pageHeight;
+
+        const wPdf = (sigW / screenPageW) * pageWidth;
+        const hPdf = (sigH / screenPageH) * pageHeight;
+
+        page.drawImage(pngImage, { x: xPdf, y: yPdf, width: wPdf, height: hPdf, opacity: 1 });
+
+        const signedBytes = await outDoc.save();
+
+        const outName = "signed_" + (originalPdfName || "document.pdf");
+        const blob = new Blob([signedBytes], { type: "application/pdf" });
+
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = outName;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      } catch (err) {
+        console.error(err);
+        alert("Save error: " + (err?.message || err));
+      }
+    });
+
+    // initial UI
+    enableControls();
+    updateKpi();
+  </script>
+</body>
+</html>
